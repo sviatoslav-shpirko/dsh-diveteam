@@ -1,0 +1,7 @@
+# @diveteam/dsh-client-diveteam-ui — DiveTeam control panel (button + sections).
+# The node half (exports ".") loads in the host process; the `dsh.client`
+# manifest in package.json makes the browser half (exports "./client", served
+# at /plugins/diveteam-ui/client.js) load in the web GUI.
+- insert:
+    - id: diveteam-ui
+      name: '@diveteam/dsh-client-diveteam-ui'

@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Утилита управления зашифрованными секретами Hermes Agent (systemd-creds)
+# Хранит зашифрованные файлы в /etc/credstore.encrypted/<NAME>.cred (привязаны к ключу хоста)
+# и расшифровывает их только в RAM (/dev/shm/hermes-creds/<NAME>).
+
+CRED_STORE="/etc/credstore.encrypted"
+RAM_CREDS_DIR="/dev/shm/hermes-creds"
+
+usage() {
+    cat <<EOF
+Использование: hermes-creds <команда> [аргументы]
+
+Команды:
+  set <NAME> <ПУТЬ_К_ФАЙЛУ>   Зашифровать файл в ${CRED_STORE}/<NAME>.cred (с обязательным --name=<NAME>) и удалить исходник через shred -u
+  set-string <NAME> <СТРОКА>  Зашифровать строку/токен напрямую в ${CRED_STORE}/<NAME>.cred без создания файлов на диске
+  sync-ram                    Расшифровать все секреты из ${CRED_STORE} в RAM (${RAM_CREDS_DIR})
+  status                      Показать список зашифрованных секретов на диске и активных секретов в RAM
+
+Примеры:
+  hermes-creds set VERTEX_SA.json ~/vertex_sa_input.json
+  hermes-creds set-string OPENCODE_GO_API_KEY "sk-..."
+  hermes-creds set-string GEMINI_API_KEY "AIza..."
+  hermes-creds status
+EOF
+}
+
+cmd="${1:-status}"
+shift || true
+
+sudo mkdir -p "$CRED_STORE"
+sudo chmod 700 "$CRED_STORE"
+mkdir -p "$RAM_CREDS_DIR"
+chmod 700 "$RAM_CREDS_DIR"
+
+case "$cmd" in
+    set)
+        name="${1:-}"
+        src_file="${2:-}"
+        if [ -z "$name" ] || [ -z "$src_file" ] || [ ! -f "$src_file" ]; then
+            echo "Ошибка: укажите имя секрета и существующий файл. Пример: hermes-creds set VERTEX_SA.json ~/vertex_sa_input.json" >&2
+            exit 1
+        fi
+        sudo systemd-creds -H --name="$name" encrypt "$src_file" "${CRED_STORE}/${name}.cred"
+        sudo chmod 600 "${CRED_STORE}/${name}.cred"
+        shred -u "$src_file"
+        echo "[+] Секрет ${name} зашифрован в ${CRED_STORE}/${name}.cred, исходный файл безопасно уничтожен (shred -u)."
+        "$0" sync-ram
+        ;;
+    set-string)
+        name="${1:-}"
+        val="${2:-}"
+        if [ -z "$name" ] || [ -z "$val" ]; then
+            echo "Ошибка: укажите имя секрета и значение. Пример: hermes-creds set-string GEMINI_API_KEY 'AIza...'" >&2
+            exit 1
+        fi
+        printf '%s' "$val" | sudo systemd-creds -H --name="$name" encrypt - "${CRED_STORE}/${name}.cred"
+        sudo chmod 600 "${CRED_STORE}/${name}.cred"
+        echo "[+] Секрет ${name} зашифрован в ${CRED_STORE}/${name}.cred напрямую из памяти."
+        "$0" sync-ram
+        ;;
+    sync-ram)
+        for enc_file in $(sudo find "$CRED_STORE" -maxdepth 1 -name '*.cred' -type f | sort); do
+            cred_name="$(basename "$enc_file" .cred)"
+            sudo systemd-creds decrypt --name="$cred_name" "$enc_file" - > "${RAM_CREDS_DIR}/${cred_name}"
+            chmod 600 "${RAM_CREDS_DIR}/${cred_name}"
+            echo "[RAM] Расшифрован в память: ${RAM_CREDS_DIR}/${cred_name}"
+        done
+        # Сборка глобального managed .env в RAM (/dev/shm/hermes-creds/managed.env <- /etc/hermes/.env)
+        MANAGED_ENV="${RAM_CREDS_DIR}/managed.env"
+        : > "$MANAGED_ENV"
+        chmod 600 "$MANAGED_ENV"
+        {
+            echo "# --- Auto-generated in RAM (/dev/shm) by hermes-creds ---"
+            if [ -s "${RAM_CREDS_DIR}/VERTEX_SA.json" ]; then
+                printf 'VERTEX_CREDENTIALS_PATH=%s/VERTEX_SA.json\n' "$RAM_CREDS_DIR"
+                printf 'GOOGLE_APPLICATION_CREDENTIALS=%s/VERTEX_SA.json\n' "$RAM_CREDS_DIR"
+            fi
+            if [ -s "${RAM_CREDS_DIR}/OPENCODE_GO_API_KEY" ]; then
+                oc_key="$(cat "${RAM_CREDS_DIR}/OPENCODE_GO_API_KEY")"
+                printf 'OPENCODE_GO_API_KEY=%s\n' "$oc_key"
+                printf 'OPENCODE_ZEN_API_KEY=%s\n' "$oc_key"
+                printf 'OPENCODE_GO_BASE_URL=https://opencode.ai/zen/go/v1\n'
+            fi
+            if [ -s "${RAM_CREDS_DIR}/GEMINI_API_KEY" ]; then
+                gm_key="$(cat "${RAM_CREDS_DIR}/GEMINI_API_KEY")"
+                printf 'GEMINI_API_KEY=%s\n' "$gm_key"
+                printf 'GOOGLE_API_KEY=%s\n' "$gm_key"
+            fi
+        } >> "$MANAGED_ENV"
+        sudo mkdir -p /etc/hermes
+        sudo chmod 755 /etc/hermes
+        sudo ln -sfn "$MANAGED_ENV" /etc/hermes/.env
+        echo "[RAM] Собран глобальный managed .env в памяти: ${MANAGED_ENV} <- /etc/hermes/.env"
+
+        # Сборка RAM .env для вторичных профилей (~/.hermes/profiles/*) из .env.template
+        PROFILES_Root="/home/slava/.hermes/profiles"
+        if [ -d "$PROFILES_Root" ]; then
+            for prof_dir in "$PROFILES_Root"/*; do
+                [ -d "$prof_dir" ] || continue
+                prof_name="$(basename "$prof_dir")"
+                tpl_file="${prof_dir}/.env.template"
+                env_link="${prof_dir}/.env"
+                ram_env="${RAM_CREDS_DIR}/${prof_name}.env"
+                if [ ! -f "$tpl_file" ] && [ -f "$env_link" ] && [ ! -L "$env_link" ]; then
+                    grep -vE '^(export )?(OPENCODE_GO_API_KEY|OPENCODE_API_KEY|OPENCODE_ZEN_API_KEY|GEMINI_API_KEY|GOOGLE_API_KEY|HERMES_DASHBOARD_BASIC_AUTH_USERNAME|HERMES_DASHBOARD_BASIC_AUTH_PASSWORD)=' "$env_link" > "$tpl_file" || true
+                    chmod 600 "$tpl_file"
+                fi
+                if [ -f "$tpl_file" ]; then
+                    cp -f "$tpl_file" "$ram_env"
+                    chmod 600 "$ram_env"
+                    {
+                        echo ""
+                        echo "# --- Auto-generated in RAM (/dev/shm) by hermes-creds ---"
+                        if [ -s "${RAM_CREDS_DIR}/OPENCODE_GO_API_KEY" ]; then
+                            oc_key="$(cat "${RAM_CREDS_DIR}/OPENCODE_GO_API_KEY")"
+                            printf 'OPENCODE_GO_API_KEY=%s\n' "$oc_key"
+                            printf 'OPENCODE_ZEN_API_KEY=%s\n' "$oc_key"
+                        fi
+                        if [ -s "${RAM_CREDS_DIR}/GEMINI_API_KEY" ]; then
+                            gm_key="$(cat "${RAM_CREDS_DIR}/GEMINI_API_KEY")"
+                            printf 'GEMINI_API_KEY=%s\n' "$gm_key"
+                            printf 'GOOGLE_API_KEY=%s\n' "$gm_key"
+                        fi
+                    } >> "$ram_env"
+                    ln -sfn "$ram_env" "$env_link"
+                    echo "[RAM] Собран профиль .env в памяти: ${ram_env} <- ${env_link}"
+                fi
+            done
+        fi
+        ;;
+    status)
+        echo "=== Зашифрованные секреты на диске (${CRED_STORE}) ==="
+        sudo ls -la "$CRED_STORE"
+        echo ""
+        echo "=== Расшифрованные секреты в RAM (${RAM_CREDS_DIR}) ==="
+        ls -la "$RAM_CREDS_DIR"
+        ;;
+    *)
+        usage
+        ;;
+esac

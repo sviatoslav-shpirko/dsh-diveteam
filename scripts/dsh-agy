@@ -1,0 +1,634 @@
+#!/usr/bin/env python3
+"""
+dsh-agy: Bridge adapter between DeepSeek Harness (dsh) / DiveTeam AI roles
+and Google Antigravity CLI (agy).
+
+Allows DiveTeam roles (shturman, arch, dev, qa, sre, reg) and direct chat users
+to safely delegate autonomous coding, refactoring, architectural planning,
+code review, and system administration tasks to `agy` while:
+  - Enforcing DiveTeam environment hygiene (stripping forbidden OPENCODE_API_KEY,
+    ensuring ~/.local/bin and /usr/local/bin in PATH);
+  - Supporting git worktree isolation (auto-detecting DIVETEAM_WORKTREE / FARVATER_WORKTREE / DSH_WORKTREE
+    and tracking pre/post git status, branch, modified files, and diff stats);
+  - Supporting privilege escalation (`--sudo` -> `sudo -n <agy_bin> --dangerously-skip-permissions`)
+    for the `sre` role under `host.lock`;
+  - Returning structured JSON (or `--human` readable summary) with full metadata.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+
+FORBIDDEN_ENV_KEYS = ("OPENCODE_API_KEY",)
+
+
+def build_sanitized_env() -> Dict[str, str]:
+    """Create a clean environment dict complying with DiveTeam security rules."""
+    env = os.environ.copy()
+    for forbidden in FORBIDDEN_ENV_KEYS:
+        env.pop(forbidden, None)
+
+    local_bin = os.path.expanduser("~/.local/bin")
+    path_parts = [p for p in env.get("PATH", "").split(":") if p]
+    for required_dir in (local_bin, "/usr/local/bin", "/usr/bin", "/bin"):
+        if required_dir not in path_parts:
+            path_parts.insert(0, required_dir)
+    env["PATH"] = ":".join(path_parts)
+
+    # Ensure GitHub token from KDE Wallet / RAM tmpfs is available in memory
+    if not env.get("GH_TOKEN") and not env.get("GITHUB_TOKEN"):
+        token_helper = os.path.join(local_bin, "dsh-github-token")
+        if os.path.isfile(token_helper) and os.access(token_helper, os.X_OK):
+            try:
+                tok_res = subprocess.run(
+                    [token_helper, "print"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                tok = tok_res.stdout.strip() if tok_res.returncode == 0 else ""
+                if tok:
+                    env["GH_TOKEN"] = tok
+                    env["GITHUB_TOKEN"] = tok
+                    env["DIVETEAM_GITHUB_TOKEN"] = tok
+                    env["FARVATER_GITHUB_TOKEN"] = tok
+            except Exception:
+                pass
+    elif env.get("GH_TOKEN") and not env.get("GITHUB_TOKEN"):
+        env["GITHUB_TOKEN"] = env["GH_TOKEN"]
+    elif env.get("GITHUB_TOKEN") and not env.get("GH_TOKEN"):
+        env["GH_TOKEN"] = env["GITHUB_TOKEN"]
+
+    cred_helper = os.path.join(local_bin, "dsh-git-credential-helper")
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    # Git-конфиг держим в единой форме GIT_CONFIG_PARAMETERS: фильтр DSH
+    # SENSITIVE_ENV_PATTERN=/KEY|PASSWORD|SECRET|TOKEN/i вычищает индексированную форму
+    # (COUNT / <KEY>_n / VALUE_n), оставляя COUNT без ключей -> git: "missing config key", exit 128.
+    _git_cfg_count_name = "GIT_CONFIG_" + "COUNT"
+    _git_cfg_key_prefix = "GIT_CONFIG_" + "KEY_"
+    for _name in [
+        n
+        for n in list(env)
+        if n == _git_cfg_count_name or n.startswith(_git_cfg_key_prefix) or n.startswith("GIT_CONFIG_VALUE_")
+    ]:
+        env.pop(_name, None)
+    if os.path.isfile(cred_helper) and os.access(cred_helper, os.X_OK):
+        env.setdefault(
+            "GIT_CONFIG_PARAMETERS",
+            f"'credential.https://github.com.helper=!{cred_helper}'"
+            f" 'url.https://github.com/.insteadOf=git@github.com:'"
+            f" 'url.https://github.com/.insteadOf=ssh://git@github.com/'",
+        )
+
+    return env
+
+
+def find_agy_binary() -> str:
+    """Locate the executable `agy` binary."""
+    env = build_sanitized_env()
+    candidates = [
+        os.environ.get("AGY_BIN", ""),
+        os.path.expanduser("~/.local/bin/agy"),
+        "/usr/local/bin/agy",
+        "/usr/bin/agy",
+        shutil.which("agy", path=env.get("PATH")),
+    ]
+    for c in candidates:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return os.path.abspath(c)
+    raise FileNotFoundError(
+        "Could not find executable 'agy' binary. Checked ~/.local/bin/agy and /usr/local/bin/agy."
+    )
+
+
+def resolve_default_workdir(explicit_workdir: Optional[str]) -> Path:
+    """Resolve working directory from CLI flag, DiveTeam/DSH env vars, or cwd."""
+    if explicit_workdir:
+        return Path(explicit_workdir).expanduser().resolve()
+    for env_key in ("DIVETEAM_WORKTREE", "FARVATER_WORKTREE", "DSH_WORKTREE", "DIVETEAM_WORKDIR", "FARVATER_WORKDIR"):
+        val = os.environ.get(env_key, "").strip()
+        if val:
+            return Path(val).expanduser().resolve()
+    return Path.cwd().resolve()
+
+
+def get_git_status(workdir: Path) -> Tuple[bool, str, List[str], str]:
+    """Returns (is_git, branch_name, list_of_modified_files, diff_stat)."""
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if res.returncode != 0 or res.stdout.strip() != "true":
+            return False, "", [], ""
+
+        branch_res = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        branch = branch_res.stdout.strip() if branch_res.returncode == 0 else ""
+
+        status_res = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        files: List[str] = []
+        for line in status_res.stdout.splitlines():
+            stripped = line.strip()
+            if stripped:
+                parts = stripped.split(maxsplit=1)
+                if len(parts) == 2:
+                    files.append(parts[1])
+
+        diff_res = subprocess.run(
+            ["git", "diff", "--stat"],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return True, branch, files, diff_res.stdout.strip()
+    except Exception:
+        return False, "", [], ""
+
+
+def extract_json_payload(stdout: str) -> Optional[Dict[str, Any]]:
+    """Parse JSON from agy stdout, handling optional leading/trailing log lines."""
+    text = stdout.strip()
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: try parsing from first '{' to last '}'
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            data = json.loads(text[start : end + 1])
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    return None
+
+
+def run_task(args: argparse.Namespace) -> Dict[str, Any]:
+    role = (
+        args.role
+        or os.environ.get("DIVETEAM_ROLE")
+        or os.environ.get("FARVATER_ROLE")
+        or os.environ.get("DSH_AGENT_PRESET")
+        or None
+    )
+    task_id = (
+        args.task_id
+        or os.environ.get("DIVETEAM_TASK_ID")
+        or os.environ.get("FARVATER_TASK_ID")
+        or None
+    )
+
+    # 1. Resolve prompt
+    prompt = args.task
+    if args.task_file:
+        task_path = Path(args.task_file).expanduser().resolve()
+        if not task_path.is_file():
+            return {
+                "ok": False,
+                "error": f"Task file not found: {task_path}",
+                "role": role,
+                "task_id": task_id,
+            }
+        prompt = task_path.read_text(encoding="utf-8")
+    elif prompt == "-" or not prompt:
+        if not sys.stdin.isatty():
+            prompt = sys.stdin.read().strip()
+
+    if not prompt:
+        return {
+            "ok": False,
+            "error": "No task description provided (pass positional task, --task-file, or stdin).",
+            "role": role,
+            "task_id": task_id,
+        }
+
+    # 2. Resolve workdir
+    workdir = resolve_default_workdir(args.workdir)
+    if not workdir.is_dir():
+        return {
+            "ok": False,
+            "error": f"Working directory does not exist: {workdir}",
+            "workdir": str(workdir),
+            "role": role,
+            "task_id": task_id,
+        }
+
+    try:
+        agy_bin = find_agy_binary()
+    except FileNotFoundError as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "workdir": str(workdir),
+            "role": role,
+            "task_id": task_id,
+        }
+
+    # 3. Snapshot git status before run
+    is_git, git_branch, pre_files, _ = get_git_status(workdir)
+
+    # 4. Construct command
+    cmd: List[str] = []
+    if args.sudo:
+        cmd.extend(["sudo", "-n"])
+    cmd.extend([agy_bin, "-p", prompt, "--output-format", "json"])
+
+    if args.conversation:
+        cmd.extend(["--conversation", args.conversation])
+    elif args.continue_last:
+        cmd.append("--continue")
+
+    if args.autonomous or args.sudo:
+        cmd.append("--dangerously-skip-permissions")
+
+    if args.model:
+        cmd.extend(["--model", args.model])
+
+    if args.effort:
+        cmd.extend(["--effort", args.effort])
+
+    if args.mode:
+        cmd.extend(["--mode", args.mode])
+
+    if args.agent:
+        cmd.extend(["--agent", args.agent])
+
+    if args.json_schema:
+        cmd.extend(["--json-schema", args.json_schema])
+
+    if args.disable_slash_commands:
+        cmd.append("--disable-slash-commands")
+
+    if args.sandbox:
+        cmd.append("--sandbox")
+
+    if args.timeout and args.timeout > 0:
+        cmd.extend(["--print-timeout", f"{args.timeout}s"])
+
+    for add_dir in args.add_dir or []:
+        cmd.extend(["--add-dir", os.path.expanduser(add_dir)])
+
+    # 5. Sanitized environment
+    env = build_sanitized_env()
+
+    # 6. Execute process
+    timeout_buffer = (args.timeout or 300) + 30
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=workdir,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout_buffer,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "ok": False,
+            "error": f"Execution timed out after {args.timeout}s",
+            "workdir": str(workdir),
+            "sudo": bool(args.sudo),
+            "role": role,
+            "task_id": task_id,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"Failed to execute agy: {str(e)}",
+            "workdir": str(workdir),
+            "sudo": bool(args.sudo),
+            "role": role,
+            "task_id": task_id,
+        }
+
+    # 7. Snapshot git status after run
+    post_is_git, post_branch, post_files, diff_stat = get_git_status(workdir)
+    changed_files: List[str] = []
+    if post_is_git:
+        new_or_modified = set(post_files) - set(pre_files)
+        changed_files = sorted(list(new_or_modified | set(post_files)))
+
+    # 8. Parse JSON stdout
+    stdout = proc.stdout.strip()
+    parsed_json = extract_json_payload(stdout)
+
+    base_meta = {
+        "role": role,
+        "task_id": task_id,
+        "sudo": bool(args.sudo),
+        "workdir": str(workdir),
+        "is_git_repo": post_is_git or is_git,
+        "git_branch": post_branch or git_branch or None,
+        "files_changed": changed_files,
+        "git_diff_stat": diff_stat,
+    }
+
+    if proc.returncode != 0 and not parsed_json:
+        return {
+            "ok": False,
+            "returncode": proc.returncode,
+            "error": proc.stderr.strip() or "agy exited with non-zero status",
+            "raw_stdout": stdout,
+            **base_meta,
+        }
+
+    if parsed_json:
+        status_val = parsed_json.get("status", "SUCCESS" if proc.returncode == 0 else "FAILED")
+        return {
+            "ok": status_val == "SUCCESS" or proc.returncode == 0,
+            "status": status_val,
+            "conversation_id": parsed_json.get("conversation_id"),
+            "response": parsed_json.get("response", ""),
+            "duration_seconds": parsed_json.get("duration_seconds"),
+            "num_turns": parsed_json.get("num_turns"),
+            "usage": parsed_json.get("usage", {}),
+            **base_meta,
+            "stderr": proc.stderr.strip() if proc.stderr else None,
+        }
+
+    return {
+        "ok": proc.returncode == 0,
+        "returncode": proc.returncode,
+        "status": "SUCCESS" if proc.returncode == 0 else "FAILED",
+        "response": stdout,
+        **base_meta,
+        "stderr": proc.stderr.strip() if proc.stderr else None,
+    }
+
+
+def _clean_cli_lines(raw_stdout: str) -> List[str]:
+    """Strip carriage-return spinner frames and empty lines from agy CLI output."""
+    import re
+    ansi_re = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+    cleaned: List[str] = []
+    for raw_line in raw_stdout.splitlines():
+        # Take only the final segment after any '\r' spinner overwrites
+        segment = raw_line.split("\r")[-1]
+        segment = ansi_re.sub("", segment).strip()
+        if not segment or "Fetching available" in segment:
+            continue
+        cleaned.append(segment)
+    return cleaned
+
+
+def list_models() -> Dict[str, Any]:
+    try:
+        agy_bin = find_agy_binary()
+        env = build_sanitized_env()
+        res = subprocess.run(
+            [agy_bin, "models"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=25,
+        )
+        lines = _clean_cli_lines(res.stdout)
+        return {
+            "ok": res.returncode == 0,
+            "agy_binary": agy_bin,
+            "models": lines,
+            "output": lines,
+            "stderr": res.stderr.strip() if res.stderr else None,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def list_agents() -> Dict[str, Any]:
+    try:
+        agy_bin = find_agy_binary()
+        env = build_sanitized_env()
+        res = subprocess.run(
+            [agy_bin, "agents"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        lines = _clean_cli_lines(res.stdout)
+        return {
+            "ok": res.returncode == 0,
+            "agy_binary": agy_bin,
+            "agents": lines,
+            "output": lines,
+            "stderr": res.stderr.strip() if res.stderr else None,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def status_info() -> Dict[str, Any]:
+    try:
+        agy_bin = find_agy_binary()
+    except FileNotFoundError as e:
+        return {"ok": False, "error": str(e)}
+
+    env = build_sanitized_env()
+    try:
+        ver_res = subprocess.run(
+            [agy_bin, "--version"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        version = ver_res.stdout.strip() or ver_res.stderr.strip()
+    except Exception as e:
+        version = f"Error: {e}"
+
+    sudo_ok = False
+    try:
+        sudo_res = subprocess.run(
+            ["sudo", "-n", "true"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        sudo_ok = sudo_res.returncode == 0
+    except Exception:
+        sudo_ok = False
+
+    app_data = Path(os.path.expanduser("~/.gemini/antigravity-cli"))
+    conv_dir = app_data / "conversations"
+    conv_count = len(list(conv_dir.glob("*.db"))) if conv_dir.is_dir() else 0
+
+    workdir = resolve_default_workdir(None)
+    is_git, git_branch, modified_files, _ = get_git_status(workdir)
+
+    return {
+        "ok": True,
+        "bridge": "dsh-agy",
+        "agy_binary": agy_bin,
+        "version": version,
+        "sudo_nopasswd_available": sudo_ok,
+        "opencode_api_key_stripped": "OPENCODE_API_KEY" not in env,
+        "github_token_ready": bool(env.get("GH_TOKEN")),
+        "app_data_dir": str(app_data),
+        "saved_conversations_count": conv_count,
+        "default_workdir": str(workdir),
+        "is_git_repo": is_git,
+        "git_branch": git_branch or None,
+        "modified_files_count": len(modified_files),
+        "diveteam_env": {
+            "DIVETEAM_ROLE": os.environ.get("DIVETEAM_ROLE"),
+            "DIVETEAM_TASK_ID": os.environ.get("DIVETEAM_TASK_ID"),
+            "DIVETEAM_WORKTREE": os.environ.get("DIVETEAM_WORKTREE"),
+            "FARVATER_ROLE": os.environ.get("FARVATER_ROLE"),
+            "FARVATER_TASK_ID": os.environ.get("FARVATER_TASK_ID"),
+            "FARVATER_WORKTREE": os.environ.get("FARVATER_WORKTREE"),
+            "DSH_WORKTREE": os.environ.get("DSH_WORKTREE"),
+        },
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="dsh-agy: Bridge adapter between DeepSeek Harness (dsh) / DiveTeam AI and Google Antigravity CLI (agy)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(dest="subcommand", required=True)
+
+    # run command
+    run_parser = subparsers.add_parser("run", help="Delegate a coding, planning, review, or SRE task to agy")
+    run_parser.add_argument("task", nargs="?", default="", help="Task prompt or description (or '-' for stdin)")
+    run_parser.add_argument("--task-file", "-f", help="Read task description from a file")
+    run_parser.add_argument("--workdir", "-w", help="Working directory for agy (default: DIVETEAM_WORKTREE / FARVATER_WORKTREE / DSH_WORKTREE / cwd)")
+    run_parser.add_argument("--conversation", "-c", help="Resume existing conversation by UUID")
+    run_parser.add_argument("--continue-last", action="store_true", help="Continue the most recent conversation (--continue)")
+    run_parser.add_argument("--model", "-m", help="Model override for the agy CLI session")
+    run_parser.add_argument(
+        "--effort",
+        "-e",
+        choices=["low", "medium", "high", "xhigh", "max"],
+        default="high",
+        help="Reasoning effort (default: high)",
+    )
+    run_parser.add_argument("--mode", choices=["accept-edits", "plan"], help="Execution mode (accept-edits or plan)")
+    run_parser.add_argument("--agent", help="Agent name for the agy CLI session")
+    run_parser.add_argument("--json-schema", help="Optional JSON schema string or path to schema file")
+    run_parser.add_argument("--disable-slash-commands", action="store_true", help="Disable slash command and skill expansion")
+    run_parser.add_argument("--sandbox", action="store_true", help="Run agy with terminal sandbox restrictions enabled")
+    run_parser.add_argument(
+        "--sudo",
+        action="store_true",
+        help="Run agy via `sudo -n agy --dangerously-skip-permissions` (for SRE host administration under host.lock)",
+    )
+    run_parser.add_argument("--role", help="DiveTeam role metadata tag (e.g. dev, sre, qa, arch, shturman)")
+    run_parser.add_argument("--task-id", help="DiveTeam task ID metadata tag")
+    run_parser.add_argument("--timeout", "-t", type=int, default=300, help="Timeout in seconds (default: 300)")
+    run_parser.add_argument(
+        "--no-autonomous",
+        dest="autonomous",
+        action="store_false",
+        default=True,
+        help="Disable auto-approving tool permissions (--dangerously-skip-permissions)",
+    )
+    run_parser.add_argument("--add-dir", action="append", help="Add additional workspace directories (repeatable)")
+    run_parser.add_argument("--human", action="store_true", help="Format output for human reading instead of JSON")
+
+    # models command
+    models_parser = subparsers.add_parser("models", help="List available models in agy")
+    models_parser.add_argument("--human", action="store_true", help="Print plain model list")
+
+    # agents command
+    agents_parser = subparsers.add_parser("agents", help="List available agents in agy")
+    agents_parser.add_argument("--human", action="store_true", help="Print plain agent list")
+
+    # status command
+    status_parser = subparsers.add_parser("status", help="Show dsh-agy and agy CLI status, version, and environment")
+    status_parser.add_argument("--human", action="store_true", help="Format status for human reading")
+
+    args = parser.parse_args()
+
+    if args.subcommand == "run":
+        res = run_task(args)
+        if args.human:
+            if not res.get("ok"):
+                print(f"[ERROR] Task failed: {res.get('error')}", file=sys.stderr)
+                sys.exit(1)
+            print("=" * 64)
+            print(
+                f"Status: {res.get('status')} | Conversation ID: {res.get('conversation_id')} | Sudo: {res.get('sudo')}"
+            )
+            print(
+                f"Duration: {res.get('duration_seconds')}s | Workdir: {res.get('workdir')} | Branch: {res.get('git_branch')}"
+            )
+            if res.get("files_changed"):
+                print(f"Files Changed: {', '.join(res.get('files_changed'))}")
+            if res.get("git_diff_stat"):
+                print(f"Git Diff Stat:\n{res.get('git_diff_stat')}")
+            print("-" * 64)
+            print(res.get("response", "").strip())
+            print("=" * 64)
+        else:
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+            if not res.get("ok"):
+                sys.exit(1)
+
+    elif args.subcommand == "models":
+        res = list_models()
+        if getattr(args, "human", False) and res.get("ok"):
+            for line in res.get("models", []):
+                print(line)
+        else:
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+            if not res.get("ok"):
+                sys.exit(1)
+
+    elif args.subcommand == "agents":
+        res = list_agents()
+        if getattr(args, "human", False) and res.get("ok"):
+            for line in res.get("agents", []):
+                print(line)
+        else:
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+            if not res.get("ok"):
+                sys.exit(1)
+
+    elif args.subcommand == "status":
+        res = status_info()
+        if getattr(args, "human", False) and res.get("ok"):
+            print(f"Bridge:        {res.get('bridge')}")
+            print(f"AGY Binary:    {res.get('agy_binary')}")
+            print(f"Version:       {res.get('version')}")
+            print(f"Sudo Ready:    {res.get('sudo_nopasswd_available')}")
+            print(f"Workdir:       {res.get('default_workdir')} (git={res.get('is_git_repo')}, branch={res.get('git_branch')})")
+            print(f"Conversations: {res.get('saved_conversations_count')} in {res.get('app_data_dir')}")
+        else:
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+            if not res.get("ok"):
+                sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,32 @@
+{
+  "name": "@diveteam/root",
+  "version": "1.0.0",
+  "description": "DiveTeam: Multi-agent orchestration, Kanban board, workflow engine, and Telegram bridge for DeepSeek Harness (dsh)",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "test": "node --test packages/dsh-dispatcher/test/dispatcher.test.mjs",
+    "build": "npm run --prefix packages/dsh-client-diveteam-ui bundle",
+    "sync-roles": "node scripts/sync-roles.mjs",
+    "install:profile": "./install.sh"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "multi-agent",
+    "orchestrator",
+    "kanban",
+    "workflow",
+    "telegram",
+    "antigravity",
+    "diveteam"
+  ],
+  "author": "Sviatoslav Shpirko <sviatoslav.shpirko@gmail.com>",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

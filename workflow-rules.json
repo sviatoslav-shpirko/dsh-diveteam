@@ -1,0 +1,68 @@
+{
+  "pipeline": {
+    "autoHandoffDevToQa": true,
+    "requireDiffForQa": true,
+    "autoMergeOnQaPass": true,
+    "maxQaRetries": 2,
+    "qaEscalationTarget": "arch",
+    "escalationNotifyTelegram": true,
+    "conflictFallback": "dev",
+    "requireSreApproval": true,
+    "autoReleaseHostLock": true,
+    "parentAutoRollup": true,
+    "exportReportToVault": true,
+    "autoRunRegArchivist": true,
+    "maxHeavyWorkers": 3,
+    "maxDailyTokens": 2000000
+  },
+  "roleTransitions": {
+    "dev": {
+      "label": "Разработка (Dev)",
+      "isolationMode": "git_worktree",
+      "onSuccess": "qa",
+      "onFailure": "failed",
+      "requireApproval": false,
+      "description": "Разработка в изолированном git_worktree. При успехе передаётся в QA."
+    },
+    "qa": {
+      "label": "Проверка (QA)",
+      "isolationMode": "git_worktree",
+      "onSuccess": "merge_and_done",
+      "onFailure": "dev_or_escalate",
+      "requireApproval": false,
+      "description": "Проверка в том же worktree. PASS -> merge.lock; FAIL -> возврат в dev или эскалация."
+    },
+    "sre": {
+      "label": "️ Инфраструктура (SRE)",
+      "isolationMode": "host_exclusive",
+      "onSuccess": "done",
+      "onFailure": "failed",
+      "requireApproval": true,
+      "description": "Системные операции под host.lock. Опасные действия требуют аппрува @slava."
+    },
+    "arch": {
+      "label": "️ Архитектор (Arch)",
+      "isolationMode": "none",
+      "onSuccess": "done",
+      "onFailure": "clarify",
+      "requireApproval": false,
+      "description": "Декомпозиция задач на подзадачи с dependsOn. Вопросы Славе через Clarify."
+    },
+    "shturman": {
+      "label": "Штурман (Shturman)",
+      "isolationMode": "none",
+      "onSuccess": "done",
+      "onFailure": "clarify",
+      "requireApproval": false,
+      "description": "Главный координатор и чат (Web / Telegram). Планирует или направляет на Arch."
+    },
+    "reg": {
+      "label": "Регистратор (Reg)",
+      "isolationMode": "notes_vault",
+      "onSuccess": "done",
+      "onFailure": "failed",
+      "requireApproval": false,
+      "description": "Архивирование уроков в vault, пересборка графа graphify и git push в memvault."
+    }
+  }
+}

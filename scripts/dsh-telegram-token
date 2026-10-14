@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+"""
+dsh-telegram-token: Secure Telegram Bot token provider for DiveTeam / DSH.
+
+Retrieves the Telegram Bot token dynamically in memory (never storing it in
+plaintext on disk) from:
+  1. Environment variables in RAM (`DIVETEAM_TG_BOT_TOKEN`, `FARVATER_TG_BOT_TOKEN`, `TELEGRAM_BOT_TOKEN`)
+  2. RAM tmpfs credential store (`/dev/shm/hermes-creds/DIVETEAM_TG_BOT_TOKEN`,
+     `/dev/shm/hermes-creds/FARVATER_TG_BOT_TOKEN`,
+     `/dev/shm/hermes-creds/TELEGRAM_BOT_TOKEN`,
+     `/run/credentials/hermes-gateway.service/DIVETEAM_TG_BOT_TOKEN`,
+     `/run/credentials/hermes-gateway.service/FARVATER_TG_BOT_TOKEN`,
+     `/run/credentials/hermes-gateway.service/TELEGRAM_BOT_TOKEN`) on host (RP5)
+  3. KDE Wallet (`kdewallet`, folder `Telegram_bot_tokens`, entry `diveteam_shturman_bot`
+     with fallback to `farvater_shturman_bot`) on `p1-arch` via `kwallet-query`
+
+Subcommands:
+  status [--human]
+      Safely check token availability (masked), source, allowed ID (81815557),
+      and verify Telegram Bot API `getMe`. NEVER prints the raw token.
+  print
+      Print the raw token to stdout (for in-memory export by wrappers / dispatcher).
+  send <text>
+      Send a message to the whitelisted chat ID (81815557) without exposing the token.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+
+DEFAULT_KWALLET_NAME = (
+    os.environ.get("DIVETEAM_KWALLET_NAME")
+    or os.environ.get("FARVATER_KWALLET_NAME", "kdewallet")
+)
+DEFAULT_KWALLET_FOLDER = (
+    os.environ.get("DIVETEAM_TG_KWALLET_FOLDER")
+    or os.environ.get("FARVATER_TG_KWALLET_FOLDER", "Telegram_bot_tokens")
+)
+DEFAULT_KWALLET_ENTRY = (
+    os.environ.get("DIVETEAM_TG_KWALLET_ENTRY")
+    or os.environ.get("FARVATER_TG_KWALLET_ENTRY")
+    or "diveteam_shturman_bot"
+)
+DEFAULT_ALLOWED_ID = (
+    os.environ.get("DIVETEAM_TG_CHAT_ID")
+    or os.environ.get("DIVETEAM_TG_USER_ID")
+    or os.environ.get("FARVATER_TG_CHAT_ID")
+    or os.environ.get("FARVATER_TG_USER_ID")
+    or os.environ.get("TELEGRAM_CHAT_ID")
+    or "81815557"
+)
+
+RAM_CRED_PATHS = (
+    "/dev/shm/hermes-creds/DIVETEAM_TG_BOT_TOKEN",
+    "/dev/shm/hermes-creds/FARVATER_TG_BOT_TOKEN",
+    "/dev/shm/hermes-creds/TELEGRAM_BOT_TOKEN",
+    "/run/credentials/hermes-gateway.service/DIVETEAM_TG_BOT_TOKEN",
+    "/run/credentials/hermes-gateway.service/FARVATER_TG_BOT_TOKEN",
+    "/run/credentials/hermes-gateway.service/TELEGRAM_BOT_TOKEN",
+)
+
+ACTIVE_KWALLET_ENTRY = DEFAULT_KWALLET_ENTRY
+
+
+def mask_token(token: str) -> str:
+    """Return a safe masked representation of the bot token (never reveals the secret)."""
+    clean = token.strip()
+    if not clean:
+        return ""
+    if len(clean) <= 8:
+        return "*" * len(clean)
+    prefix = clean[:5]
+    return f"{prefix}{'*' * (len(clean) - len(prefix))}"
+
+
+def _kwallet_query_entry(wallet: str, folder: str, entry: str) -> Tuple[Optional[str], Optional[str]]:
+    kwallet_bin = shutil.which("kwallet-query") or "/usr/bin/kwallet-query"
+    if not os.path.isfile(kwallet_bin) or not os.access(kwallet_bin, os.X_OK):
+        return None, "kwallet-query binary not found"
+
+    try:
+        res = subprocess.run(
+            [kwallet_bin, "-f", folder, "-r", entry, wallet],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if res.returncode != 0:
+            err = (res.stderr or res.stdout or "").strip()
+            return None, err or f"kwallet-query exited with code {res.returncode}"
+        token = res.stdout.strip()
+        if (
+            not token
+            or token.lower().startswith("failed")
+            or "не удалось прочитать" in token.lower()
+        ):
+            return None, "Empty or invalid entry in KDE Wallet"
+        return token, None
+    except Exception as exc:
+        return None, str(exc)
+
+
+def read_kwallet_token(
+    wallet: str = DEFAULT_KWALLET_NAME,
+    folder: str = DEFAULT_KWALLET_FOLDER,
+    entry: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Fetch token from KDE Wallet via kwallet-query. Returns (token, error_msg)."""
+    global ACTIVE_KWALLET_ENTRY
+    if entry:
+        candidates = [entry]
+    else:
+        configured = (
+            os.environ.get("DIVETEAM_TG_KWALLET_ENTRY")
+            or os.environ.get("FARVATER_TG_KWALLET_ENTRY")
+        )
+        if configured:
+            candidates = [configured]
+        else:
+            candidates = ["diveteam_shturman_bot", "farvater_shturman_bot"]
+
+    last_err = None
+    for candidate in candidates:
+        token, err = _kwallet_query_entry(wallet, folder, candidate)
+        if token:
+            ACTIVE_KWALLET_ENTRY = candidate
+            return token, None
+        last_err = err
+    ACTIVE_KWALLET_ENTRY = candidates[0]
+    return None, last_err
+
+
+def resolve_token(prefer_kwallet: bool = False) -> Tuple[Optional[str], str, Optional[str]]:
+    """
+    Resolve Telegram Bot token from available secure sources in RAM or KDE Wallet.
+    Returns (token, source_description, error_if_any).
+    """
+    if not prefer_kwallet:
+        for env_key in ("DIVETEAM_TG_BOT_TOKEN", "FARVATER_TG_BOT_TOKEN", "TELEGRAM_BOT_TOKEN"):
+            val = os.environ.get(env_key, "").strip()
+            if val:
+                return val, f"env:{env_key}", None
+
+        for cred_path in RAM_CRED_PATHS:
+            p = Path(cred_path)
+            if p.is_file():
+                try:
+                    val = p.read_text(encoding="utf-8").strip()
+                    if val:
+                        return val, f"tmpfs:{cred_path}", None
+                except Exception:
+                    pass
+
+    token, err = read_kwallet_token()
+    if token:
+        return (
+            token,
+            f"kdewallet:{DEFAULT_KWALLET_NAME}/{DEFAULT_KWALLET_FOLDER}/{ACTIVE_KWALLET_ENTRY}",
+            None,
+        )
+
+    if prefer_kwallet:
+        for env_key in ("DIVETEAM_TG_BOT_TOKEN", "FARVATER_TG_BOT_TOKEN", "TELEGRAM_BOT_TOKEN"):
+            val = os.environ.get(env_key, "").strip()
+            if val:
+                return val, f"env:{env_key}", None
+        for cred_path in RAM_CRED_PATHS:
+            p = Path(cred_path)
+            if p.is_file():
+                try:
+                    val = p.read_text(encoding="utf-8").strip()
+                    if val:
+                        return val, f"tmpfs:{cred_path}", None
+                except Exception:
+                    pass
+
+    return None, "none", err or "No Telegram token found in env, /dev/shm/hermes-creds, or KDE Wallet"
+
+
+def telegram_api_call(token: str, method: str, payload: Optional[Dict[str, Any]] = None) -> Tuple[int, Dict[str, Any]]:
+    """Call Telegram Bot API method without ever logging the token URL."""
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    headers = {"User-Agent": "diveteam-dsh-telegram-token/1.0"}
+    data_bytes = None
+    if payload is not None:
+        headers["Content-Type"] = "application/json; charset=utf-8"
+        data_bytes = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST" if payload is not None else "GET")
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(body) if body else {}
+            return resp.status, data if isinstance(data, dict) else {}
+    except urllib.error.HTTPError as err:
+        try:
+            body = err.read().decode("utf-8", errors="replace")
+            data = json.loads(body) if body else {}
+        except Exception:
+            data = {"description": f"HTTP {err.code}"}
+        return err.code, data if isinstance(data, dict) else {}
+    except Exception as exc:
+        # Sanitize any accidental token appearance in exception message
+        msg = str(exc).replace(token, "***")
+        return 0, {"description": msg}
+
+
+def cmd_status(prefer_kwallet: bool = True) -> Dict[str, Any]:
+    """Verify token availability and Telegram `getMe` without exposing the secret."""
+    kwallet_token, kwallet_err = read_kwallet_token()
+    token, source, err = resolve_token(prefer_kwallet=prefer_kwallet)
+    if not token:
+        return {
+            "ok": False,
+            "source": source,
+            "kwallet_available": False,
+            "kwallet_entry": f"{DEFAULT_KWALLET_NAME}:{DEFAULT_KWALLET_FOLDER}/{ACTIVE_KWALLET_ENTRY}",
+            "kwallet_error": kwallet_err,
+            "token_present": False,
+            "allowed_chat_id": DEFAULT_ALLOWED_ID,
+            "allowed_user_id": DEFAULT_ALLOWED_ID,
+            "error": err,
+        }
+
+    http_status, api_data = telegram_api_call(token, "getMe")
+    bot_info = api_data.get("result") if isinstance(api_data.get("result"), dict) else {}
+    ok = bool(http_status == 200 and api_data.get("ok") and bot_info.get("id"))
+
+    return {
+        "ok": ok,
+        "source": source,
+        "kwallet_available": kwallet_token is not None,
+        "kwallet_entry": f"{DEFAULT_KWALLET_NAME}:{DEFAULT_KWALLET_FOLDER}/{ACTIVE_KWALLET_ENTRY}",
+        "token_present": True,
+        "token_length": len(token),
+        "token_masked": mask_token(token),
+        "bot_id": bot_info.get("id"),
+        "bot_username": bot_info.get("username"),
+        "bot_first_name": bot_info.get("first_name"),
+        "allowed_chat_id": DEFAULT_ALLOWED_ID,
+        "allowed_user_id": DEFAULT_ALLOWED_ID,
+        "error": None if ok else (api_data.get("description") or f"HTTP {http_status}"),
+    }
+
+
+def format_markdown_for_telegram_html(text: str) -> str:
+    """Use packages/dsh-dispatcher/lib/telegram.js formatMarkdownForTelegramHtml when available."""
+    telegram_js = Path("/home/slava/Projects/DSH/packages/dsh-dispatcher/lib/telegram.js")
+    node_bin = shutil.which("node") or "/usr/bin/node"
+    if telegram_js.is_file() and os.path.isfile(node_bin):
+        try:
+            res = subprocess.run(
+                [
+                    node_bin,
+                    "-e",
+                    (
+                        "import { formatMarkdownForTelegramHtml } from "
+                        "'/home/slava/Projects/DSH/packages/dsh-dispatcher/lib/telegram.js';"
+                        "let d='';process.stdin.on('data',c=>d+=c);"
+                        "process.stdin.on('end',()=>process.stdout.write(formatMarkdownForTelegramHtml(d)));"
+                    ),
+                ],
+                input=text,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                return res.stdout.strip()
+        except Exception:
+            pass
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def cmd_send(text: str, chat_id: str) -> Dict[str, Any]:
+    """Send a Markdown/HTML formatted message to the allowed chat_id without exposing the token."""
+    token, source, err = resolve_token(prefer_kwallet=False)
+    if not token:
+        return {"ok": False, "error": err}
+    html_text = format_markdown_for_telegram_html(text)
+    http_status, api_data = telegram_api_call(
+        token,
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": html_text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+    )
+    if http_status != 200 or not api_data.get("ok"):
+        http_status, api_data = telegram_api_call(
+            token,
+            "sendMessage",
+            {"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
+        )
+    msg_res = api_data.get("result") if isinstance(api_data.get("result"), dict) else {}
+    ok = bool(http_status == 200 and api_data.get("ok"))
+    return {
+        "ok": ok,
+        "source": source,
+        "chat_id": chat_id,
+        "message_id": msg_res.get("message_id"),
+        "error": None if ok else (api_data.get("description") or f"HTTP {http_status}"),
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="dsh-telegram-token: Secure Telegram Bot token provider for DiveTeam / DSH"
+    )
+    subparsers = parser.add_subparsers(dest="subcommand")
+
+    status_p = subparsers.add_parser("status", help="Safely verify token and Telegram getMe (masked)")
+    status_p.add_argument("--human", action="store_true", help="Human-readable summary output")
+
+    print_p = subparsers.add_parser("print", help="Output token for in-memory env export")
+    print_p.add_argument("--prefer-kwallet", action="store_true", help="Read directly from KDE Wallet first")
+
+    send_p = subparsers.add_parser("send", help="Send a message to the whitelisted Telegram chat")
+    send_p.add_argument("text", help="Message text to send")
+    send_p.add_argument("--chat-id", default=DEFAULT_ALLOWED_ID, help="Target chat ID (default: 81815557)")
+
+    args = parser.parse_args()
+    sub = args.subcommand or "status"
+
+    if sub == "print":
+        token, _, err = resolve_token(prefer_kwallet=getattr(args, "prefer_kwallet", False))
+        if not token:
+            sys.stderr.write(f"dsh-telegram-token: {err}\n")
+            sys.exit(1)
+        sys.stdout.write(token)
+        sys.stdout.flush()
+        sys.exit(0)
+
+    if sub == "send":
+        res = cmd_send(args.text, getattr(args, "chat_id", DEFAULT_ALLOWED_ID))
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        sys.exit(0 if res.get("ok") else 1)
+
+    if sub == "status":
+        res = cmd_status()
+        if getattr(args, "human", False):
+            print(f"OK:              {res.get('ok')}")
+            print(f"Source:          {res.get('source')}")
+            print(f"KDE Wallet:      {res.get('kwallet_available')} ({res.get('kwallet_entry')})")
+            print(f"Token (masked):  {res.get('token_masked')} (length={res.get('token_length')})")
+            print(f"Bot:             @{res.get('bot_username')} ({res.get('bot_first_name')}, id={res.get('bot_id')})")
+            print(f"Allowed ID:      chat_id={res.get('allowed_chat_id')}, user_id={res.get('allowed_user_id')}")
+        else:
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+        sys.exit(0 if res.get("ok") else 1)
+
+
+if __name__ == "__main__":
+    main()

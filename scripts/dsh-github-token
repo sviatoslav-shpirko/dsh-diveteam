@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""
+dsh-github-token: Secure GitHub token provider & Git Credential Helper for DiveTeam / DSH.
+
+Retrieves the GitHub Personal Access Token dynamically in memory (never storing
+it in plaintext on disk) from:
+  1. Environment variables in RAM (`DIVETEAM_GITHUB_TOKEN`, `FARVATER_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`)
+  2. RAM tmpfs credential store (`/dev/shm/hermes-creds/GITHUB_TOKEN`,
+     `/run/credentials/hermes-gateway.service/GITHUB_TOKEN`) on host (RP5)
+  3. KDE Wallet (`kdewallet`, folder `Git_tokens`, entry `github_first_test_token`)
+     on `p1-arch` via `kwallet-query`
+
+Subcommands:
+  status [--repo owner/name] [--human]
+      Check token availability, masked metadata, and verify GitHub API & repo access.
+      NEVER prints the raw token. (Default subcommand when invoked without arguments.)
+  get
+      Git credential helper protocol (`git credential` `get` operation).
+  store | erase
+      Git credential helper no-op hooks (never writes plaintext token to disk).
+  print
+      Print the raw token to stdout (for `export GH_TOKEN="$(dsh-github-token print)"`).
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+
+DEFAULT_KWALLET_NAME = (
+    os.environ.get("DIVETEAM_KWALLET_NAME")
+    or os.environ.get("FARVATER_KWALLET_NAME", "kdewallet")
+)
+DEFAULT_KWALLET_FOLDER = (
+    os.environ.get("DIVETEAM_KWALLET_FOLDER")
+    or os.environ.get("FARVATER_KWALLET_FOLDER", "Git_tokens")
+)
+DEFAULT_KWALLET_ENTRY = (
+    os.environ.get("DIVETEAM_KWALLET_ENTRY")
+    or os.environ.get("FARVATER_KWALLET_ENTRY", "github_first_test_token")
+)
+DEFAULT_VERIFY_REPO = (
+    os.environ.get("DIVETEAM_MEMVAULT_REPO")
+    or os.environ.get("FARVATER_MEMVAULT_REPO", "sviatoslav-shpirko/memvault")
+)
+
+RAM_CRED_PATHS = (
+    "/dev/shm/hermes-creds/GITHUB_TOKEN",
+    "/run/credentials/hermes-gateway.service/GITHUB_TOKEN",
+)
+
+
+def mask_token(token: str) -> str:
+    """Return a safe masked representation of the token (never reveals the secret)."""
+    clean = token.strip()
+    if not clean:
+        return ""
+    if len(clean) <= 8:
+        return "*" * len(clean)
+    prefix = clean[:4] if clean.startswith(("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_")) else clean[:3]
+    return f"{prefix}{'*' * (len(clean) - len(prefix))}"
+
+
+def read_kwallet_token(
+    wallet: str = DEFAULT_KWALLET_NAME,
+    folder: str = DEFAULT_KWALLET_FOLDER,
+    entry: str = DEFAULT_KWALLET_ENTRY,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Fetch token from KDE Wallet via kwallet-query. Returns (token, error_msg)."""
+    kwallet_bin = shutil.which("kwallet-query") or "/usr/bin/kwallet-query"
+    if not os.path.isfile(kwallet_bin) or not os.access(kwallet_bin, os.X_OK):
+        return None, "kwallet-query binary not found"
+
+    try:
+        res = subprocess.run(
+            [kwallet_bin, "-f", folder, "-r", entry, wallet],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if res.returncode != 0:
+            err = (res.stderr or res.stdout or "").strip()
+            return None, err or f"kwallet-query exited with code {res.returncode}"
+        token = res.stdout.strip()
+        if not token or token.lower().startswith("failed"):
+            return None, "Empty or invalid entry in KDE Wallet"
+        return token, None
+    except Exception as exc:
+        return None, str(exc)
+
+
+def resolve_token(prefer_kwallet: bool = False) -> Tuple[Optional[str], str, Optional[str]]:
+    """
+    Resolve GitHub token from available secure sources in RAM or KDE Wallet.
+    Returns (token, source_description, error_if_any).
+    """
+    if not prefer_kwallet:
+        for env_key in ("DIVETEAM_GITHUB_TOKEN", "FARVATER_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+            val = os.environ.get(env_key, "").strip()
+            if val:
+                return val, f"env:{env_key}", None
+
+        for cred_path in RAM_CRED_PATHS:
+            p = Path(cred_path)
+            if p.is_file():
+                try:
+                    val = p.read_text(encoding="utf-8").strip()
+                    if val:
+                        return val, f"tmpfs:{cred_path}", None
+                except Exception:
+                    pass
+
+    token, err = read_kwallet_token()
+    if token:
+        return (
+            token,
+            f"kdewallet:{DEFAULT_KWALLET_NAME}/{DEFAULT_KWALLET_FOLDER}/{DEFAULT_KWALLET_ENTRY}",
+            None,
+        )
+
+    # Fallback to env/tmpfs if prefer_kwallet was True but kwallet failed
+    if prefer_kwallet:
+        for env_key in ("DIVETEAM_GITHUB_TOKEN", "FARVATER_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+            val = os.environ.get(env_key, "").strip()
+            if val:
+                return val, f"env:{env_key}", None
+        for cred_path in RAM_CRED_PATHS:
+            p = Path(cred_path)
+            if p.is_file():
+                try:
+                    val = p.read_text(encoding="utf-8").strip()
+                    if val:
+                        return val, f"tmpfs:{cred_path}", None
+                except Exception:
+                    pass
+
+    return None, "none", err or "No GitHub token found in env, /dev/shm/hermes-creds, or KDE Wallet"
+
+
+def github_api_get(url: str, token: str) -> Tuple[int, Dict[str, Any], Dict[str, str]]:
+    """Perform an authenticated GET request to GitHub REST API."""
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "diveteam-dsh-github-token/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(body) if body else {}
+            headers = {k.lower(): v for k, v in resp.headers.items()}
+            return resp.status, data if isinstance(data, dict) else {"items": data}, headers
+    except urllib.error.HTTPError as err:
+        try:
+            body = err.read().decode("utf-8", errors="replace")
+            data = json.loads(body) if body else {}
+        except Exception:
+            data = {"message": str(err)}
+        return err.code, data if isinstance(data, dict) else {"message": str(data)}, {}
+    except Exception as exc:
+        return 0, {"message": str(exc)}, {}
+
+
+def cmd_status(repo: str, prefer_kwallet: bool = True) -> Dict[str, Any]:
+    """Verify token availability and GitHub API access without exposing the secret."""
+    kwallet_token, kwallet_err = read_kwallet_token()
+    token, source, err = resolve_token(prefer_kwallet=prefer_kwallet)
+    if not token:
+        return {
+            "ok": False,
+            "source": source,
+            "kwallet_available": False,
+            "kwallet_error": kwallet_err,
+            "token_present": False,
+            "error": err,
+        }
+
+    user_status, user_data, user_headers = github_api_get("https://api.github.com/user", token)
+    scopes_raw = user_headers.get("x-oauth-scopes", "")
+    scopes: List[str] = [s.strip() for s in scopes_raw.split(",") if s.strip()]
+
+    repo_status, repo_data, _ = github_api_get(f"https://api.github.com/repos/{repo}", token)
+
+    ok = user_status == 200 and repo_status == 200
+    helper_path = os.path.expanduser("~/.local/bin/dsh-git-credential-helper")
+
+    return {
+        "ok": ok,
+        "source": source,
+        "kwallet_available": kwallet_token is not None,
+        "kwallet_entry": f"{DEFAULT_KWALLET_NAME}:{DEFAULT_KWALLET_FOLDER}/{DEFAULT_KWALLET_ENTRY}",
+        "token_present": True,
+        "token_length": len(token),
+        "token_masked": mask_token(token),
+        "github_user": {
+            "status": user_status,
+            "login": user_data.get("login"),
+            "id": user_data.get("id"),
+            "name": user_data.get("name"),
+        },
+        "oauth_scopes": scopes,
+        "target_repo": {
+            "status": repo_status,
+            "full_name": repo_data.get("full_name", repo),
+            "private": repo_data.get("private"),
+            "default_branch": repo_data.get("default_branch"),
+            "permissions": repo_data.get("permissions"),
+            "html_url": repo_data.get("html_url", f"https://github.com/{repo}"),
+        },
+        "credential_helper": helper_path if os.path.exists(helper_path) else None,
+    }
+
+
+def cmd_credential_get() -> int:
+    """Implement Git credential helper `get` operation over stdin/stdout."""
+    attrs: Dict[str, str] = {}
+    if not sys.stdin.isatty():
+        for raw_line in sys.stdin:
+            line = raw_line.strip()
+            if not line:
+                break
+            if "=" in line:
+                k, v = line.split("=", 1)
+                attrs[k.strip()] = v.strip()
+
+    host = attrs.get("host", "github.com").lower()
+    if host and host not in ("github.com", "api.github.com", "gist.github.com"):
+        return 0
+
+    token, _, _ = resolve_token(prefer_kwallet=False)
+    if not token:
+        return 1
+
+    protocol = attrs.get("protocol", "https")
+    sys.stdout.write(f"protocol={protocol}\n")
+    sys.stdout.write(f"host={attrs.get('host', 'github.com')}\n")
+    sys.stdout.write("username=x-access-token\n")
+    sys.stdout.write(f"password={token}\n\n")
+    sys.stdout.flush()
+    return 0
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="dsh-github-token: Secure GitHub token provider & Git Credential Helper for DiveTeam / DSH"
+    )
+    subparsers = parser.add_subparsers(dest="subcommand")
+
+    status_p = subparsers.add_parser("status", help="Safely verify token and GitHub API access (masked)")
+    status_p.add_argument("--repo", default=DEFAULT_VERIFY_REPO, help="Repository to check (default: sviatoslav-shpirko/memvault)")
+    status_p.add_argument("--human", action="store_true", help="Human-readable summary output")
+
+    subparsers.add_parser("get", help="Git credential helper 'get' operation")
+    subparsers.add_parser("store", help="Git credential helper 'store' operation (no-op)")
+    subparsers.add_parser("erase", help="Git credential helper 'erase' operation (no-op)")
+
+    print_p = subparsers.add_parser("print", help="Output token for in-memory env export")
+    print_p.add_argument("--prefer-kwallet", action="store_true", help="Read directly from KDE Wallet first")
+
+    args = parser.parse_args()
+    sub = args.subcommand or "status"
+
+    if sub in ("store", "erase"):
+        sys.exit(0)
+
+    if sub == "get":
+        sys.exit(cmd_credential_get())
+
+    if sub == "print":
+        token, _, err = resolve_token(prefer_kwallet=getattr(args, "prefer_kwallet", False))
+        if not token:
+            sys.stderr.write(f"dsh-github-token: {err}\n")
+            sys.exit(1)
+        sys.stdout.write(token)
+        sys.stdout.flush()
+        sys.exit(0)
+
+    if sub == "status":
+        res = cmd_status(repo=getattr(args, "repo", DEFAULT_VERIFY_REPO))
+        if getattr(args, "human", False):
+            print(f"OK:              {res.get('ok')}")
+            print(f"Source:          {res.get('source')}")
+            print(f"KDE Wallet:      {res.get('kwallet_available')} ({res.get('kwallet_entry')})")
+            print(f"Token (masked):  {res.get('token_masked')} (length={res.get('token_length')})")
+            gh_user = res.get("github_user") or {}
+            print(f"GitHub User:     {gh_user.get('login')} (HTTP {gh_user.get('status')})")
+            print(f"OAuth Scopes:    {', '.join(res.get('oauth_scopes') or [])}")
+            repo_info = res.get("target_repo") or {}
+            print(
+                f"Target Repo:     {repo_info.get('full_name')} "
+                f"(HTTP {repo_info.get('status')}, private={repo_info.get('private')}, "
+                f"branch={repo_info.get('default_branch')}, perms={repo_info.get('permissions')})"
+            )
+            print(f"Cred Helper:     {res.get('credential_helper')}")
+        else:
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+        sys.exit(0 if res.get("ok") else 1)
+
+
+if __name__ == "__main__":
+    main()

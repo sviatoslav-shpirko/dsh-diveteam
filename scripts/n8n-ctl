@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STACK_DIR="/home/slava/n8n-stack"
+DOCKERFILE="${STACK_DIR}/Dockerfile"
+
+usage() {
+    cat <<EOF
+Использование: n8n-ctl <команда> [аргументы]
+
+Команды:
+  add-npm <pkg1> [pkg2...]   Добавить npm-пакеты в Dockerfile и пересобрать контейнер n8n
+  add-apk <pkg1> [pkg2...]   Добавить системные Alpine-пакеты (apk) в Dockerfile и пересобрать n8n
+  rebuild                    Пересобрать и перезапустить контейнер n8n (docker compose up -d --build)
+  restart                    Перезапустить стек n8n
+  logs                       Показать логи n8n в реальном времени
+  status                     Показать статус контейнеров n8n и Postgres
+EOF
+}
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+    add-npm)
+        if [ $# -eq 0 ]; then
+            echo "Укажите хотя бы один npm-пакет, например: n8n-ctl add-npm pdf-parse" >&2
+            exit 1
+        fi
+        for pkg in "$@"; do
+            if ! grep -qE "^[[:space:]]*${pkg}([[:space:]]|\\|$)" "$DOCKERFILE"; then
+                sed -i "/npm install -g/a \\    ${pkg} \\\\" "$DOCKERFILE"
+                echo "[+] Добавлен npm-пакет в Dockerfile: ${pkg}"
+            else
+                echo "[=] Пакет ${pkg} уже есть в Dockerfile"
+            fi
+        done
+        cd "$STACK_DIR"
+        docker compose up -d --build n8n
+        ;;
+    add-apk)
+        if [ $# -eq 0 ]; then
+            echo "Укажите хотя бы один apk-пакет, например: n8n-ctl add-apk imagemagick" >&2
+            exit 1
+        fi
+        for pkg in "$@"; do
+            if ! grep -qE "^[[:space:]]*${pkg}([[:space:]]|\\|$)" "$DOCKERFILE"; then
+                sed -i "/apk add --no-cache/a \\    ${pkg} \\\\" "$DOCKERFILE"
+                echo "[+] Добавлен apk-пакет в Dockerfile: ${pkg}"
+            else
+                echo "[=] Пакет ${pkg} уже есть в Dockerfile"
+            fi
+        done
+        cd "$STACK_DIR"
+        docker compose up -d --build n8n
+        ;;
+    rebuild)
+        cd "$STACK_DIR"
+        docker compose up -d --build
+        ;;
+    restart)
+        cd "$STACK_DIR"
+        docker compose restart
+        ;;
+    logs)
+        cd "$STACK_DIR"
+        docker compose logs -f n8n
+        ;;
+    status)
+        cd "$STACK_DIR"
+        docker compose ps
+        ;;
+    *)
+        usage
+        ;;
+esac

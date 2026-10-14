@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+*/node_modules/
+package-lock.json
+pnpm-lock.yaml
+
+# Runtime data & dynamic state (do not commit host state)
+ledger.json
+workflow-rules.json.bak*
+.dsh-telegram-session.json
+*.log
+nohup.out
+
+# Git worktrees directory for agent tasks
+worktrees/
+
+# External Git Knowledge Vault (managed in separate repository: sviatoslav-shpirko/memvault)
+vault/
+
+# Local DSH runtime artifacts & cache
+.dsh/
+.wireit/
+dist/
+*.tsbuildinfo
+
+# Temporary / backup files
+*.bak*
+*.tmp
+/tmp/
+.env
+.env.local

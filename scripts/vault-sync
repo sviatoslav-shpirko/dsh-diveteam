@@ -1,0 +1,512 @@
+#!/usr/bin/env python3
+"""
+vault-sync: Synchronize the DiveTeam knowledge vault (/home/slava/Projects/DSH/vault)
+with its `graphify` associative knowledge graph and remote GitHub repository
+(https://github.com/sviatoslav-shpirko/memvault.git) over HTTPS using the KDE Wallet token.
+
+Usage:
+  vault-sync                          # update graphify + git commit + git push origin main
+  vault-sync -m "commit message"      # custom commit message
+  vault-sync --no-push                # update graphify + local git commit only
+  vault-sync sync [-m "..."]          # explicit sync subcommand
+  vault-sync query "<question>"       # search vault/graphify-out/graph.json + markdown notes
+  vault-sync status                   # inspect vault git & graphify status
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+
+DEFAULT_VAULT_DIR = (
+    os.environ.get("DIVETEAM_VAULT_DIR")
+    or os.environ.get("FARVATER_VAULT_DIR", "/home/slava/Projects/DSH/vault")
+)
+DEFAULT_REMOTE_URL = (
+    os.environ.get("DIVETEAM_MEMVAULT_URL")
+    or os.environ.get("FARVATER_MEMVAULT_URL", "https://github.com/sviatoslav-shpirko/memvault.git")
+)
+CRED_HELPER_PATH = os.path.expanduser("~/.local/bin/dsh-git-credential-helper")
+TOKEN_HELPER_PATH = os.path.expanduser("~/.local/bin/dsh-github-token")
+
+REQUIRED_DIRS = (
+    "inbox",
+    "notes",
+    "tasks/done",
+    "memory/lessons",
+    "memory/proposals",
+)
+
+# Bilateral RU <-> EN concept expansion map for cross-language graph queries
+CONCEPT_SYNONYMS: Dict[str, List[str]] = {
+    "core": ["core", "память", "базовая", "владелец", "окружение", "ролей"],
+    "память": ["core", "memory", "vault", "хранилище", "memvault", "graphify"],
+    "токен": ["token", "kde", "wallet", "kdewallet", "github", "creds", "dsh-github-token"],
+    "token": ["токен", "kde", "wallet", "kdewallet", "github", "creds", "dsh-github-token"],
+    "kde": ["kde", "wallet", "kdewallet", "токен", "github", "git_tokens"],
+    "kdewallet": ["kde", "wallet", "kdewallet", "токен", "github", "git_tokens"],
+    "github": ["github", "memvault", "токен", "https", "credential", "kdewallet"],
+    "memvault": ["memvault", "vault", "хранилище", "github", "graphify"],
+    "graphify": ["graphify", "граф", "vault", "индексация", "бутстрап", "update", "query"],
+    "граф": ["graphify", "граф", "узлы", "связанные", "vault"],
+    "agy": ["agy", "dsh-agy", "antigravity", "адаптер", "скилл"],
+    "dsh-agy": ["agy", "dsh-agy", "antigravity", "адаптер", "скилл"],
+    "конвейер": ["конвейер", "dev", "qa", "merge", "worktree", "диспетчер"],
+    "worktree": ["worktree", "конвейер", "dev", "qa", "merge"],
+    "архитектура": ["архитектура", "diveteam", "фарватер", "farvater", "ролей", "мультиагентное", "dsh"],
+    "diveteam": ["diveteam", "фарватер", "farvater", "архитектура", "core", "ролей"],
+    "farvater": ["diveteam", "фарватер", "farvater", "архитектура", "core", "ролей"],
+    "фарватер": ["diveteam", "фарватер", "farvater", "архитектура", "core", "ролей"],
+    "роли": ["ролей", "команда", "shturman", "arch", "dev", "qa", "sre", "reg"],
+    "reg": ["reg", "регистратор", "архивариус", "lessons", "vault-sync"],
+    "пирог": ["пирог", "яблочный", "яблоками", "духовке", "рецепт"],
+    "крылышки": ["крылышки", "свиные", "запечённые", "духовке", "рецепт"],
+}
+
+
+def build_env() -> Dict[str, str]:
+    env = os.environ.copy()
+    env.pop("OPENCODE_API_KEY", None)
+    local_bin = os.path.expanduser("~/.local/bin")
+    path_parts = [p for p in env.get("PATH", "").split(":") if p]
+    for d in (local_bin, "/usr/local/bin", "/usr/bin", "/bin"):
+        if d not in path_parts:
+            path_parts.insert(0, d)
+    env["PATH"] = ":".join(path_parts)
+
+    if not env.get("GH_TOKEN") and os.path.isfile(TOKEN_HELPER_PATH) and os.access(TOKEN_HELPER_PATH, os.X_OK):
+        try:
+            res = subprocess.run([TOKEN_HELPER_PATH, "print"], capture_output=True, text=True, timeout=5)
+            tok = res.stdout.strip() if res.returncode == 0 else ""
+            if tok:
+                env["GH_TOKEN"] = tok
+                env["GITHUB_TOKEN"] = tok
+                env["DIVETEAM_GITHUB_TOKEN"] = tok
+                env["FARVATER_GITHUB_TOKEN"] = tok
+        except Exception:
+            pass
+
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    # Git-конфиг держим в единой форме GIT_CONFIG_PARAMETERS: фильтр DSH
+    # SENSITIVE_ENV_PATTERN=/KEY|PASSWORD|SECRET|TOKEN/i вычищает индексированную форму
+    # (COUNT / <KEY>_n / VALUE_n), оставляя COUNT без ключей -> git: "missing config key", exit 128.
+    _git_cfg_count_name = "GIT_CONFIG_" + "COUNT"
+    _git_cfg_key_prefix = "GIT_CONFIG_" + "KEY_"
+    for _name in [
+        n
+        for n in list(env)
+        if n == _git_cfg_count_name or n.startswith(_git_cfg_key_prefix) or n.startswith("GIT_CONFIG_VALUE_")
+    ]:
+        env.pop(_name, None)
+    if os.path.isfile(CRED_HELPER_PATH) and os.access(CRED_HELPER_PATH, os.X_OK):
+        env["GIT_CONFIG_PARAMETERS"] = (
+            f"'credential.https://github.com.helper=!{CRED_HELPER_PATH}'"
+            f" 'url.https://github.com/.insteadOf=git@github.com:'"
+            f" 'url.https://github.com/.insteadOf=ssh://git@github.com/'"
+        )
+    return env
+
+
+def run_git(vault_dir: Path, args: List[str], env: Dict[str, str], check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args],
+        cwd=vault_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=check,
+        timeout=60,
+    )
+
+
+def ensure_vault_git_setup(vault_dir: Path, env: Dict[str, str]) -> None:
+    vault_dir.mkdir(parents=True, exist_ok=True)
+    for rel in REQUIRED_DIRS:
+        sub = vault_dir / rel
+        sub.mkdir(parents=True, exist_ok=True)
+        gitkeep = sub / ".gitkeep"
+        if not gitkeep.exists():
+            gitkeep.write_text("", encoding="utf-8")
+
+    if not (vault_dir / ".git").exists():
+        run_git(vault_dir, ["init", "-b", "main"], env=env)
+
+    # Configure local repository settings (no plaintext tokens!)
+    run_git(vault_dir, ["config", "credential.helper", f"!{CRED_HELPER_PATH}"], env=env, check=False)
+    run_git(vault_dir, ["config", "credential.https://github.com.helper", f"!{CRED_HELPER_PATH}"], env=env, check=False)
+
+    # Ensure user.name and user.email
+    name_res = run_git(vault_dir, ["config", "user.name"], env=env, check=False)
+    if not name_res.stdout.strip():
+        run_git(vault_dir, ["config", "user.name", "slava"], env=env, check=False)
+    email_res = run_git(vault_dir, ["config", "user.email"], env=env, check=False)
+    if not email_res.stdout.strip():
+        run_git(vault_dir, ["config", "user.email", "oblako550@gmail.com"], env=env, check=False)
+
+    # Ensure origin remote points to https://github.com/sviatoslav-shpirko/memvault.git
+    rem_res = run_git(vault_dir, ["remote", "get-url", "origin"], env=env, check=False)
+    if rem_res.returncode != 0:
+        run_git(vault_dir, ["remote", "add", "origin", DEFAULT_REMOTE_URL], env=env, check=False)
+    elif rem_res.stdout.strip() != DEFAULT_REMOTE_URL:
+        run_git(vault_dir, ["remote", "set-url", "origin", DEFAULT_REMOTE_URL], env=env, check=False)
+
+
+def update_graphify(vault_dir: Path, env: Dict[str, str], force: bool = True) -> Tuple[bool, str]:
+    graphify_bin = shutil.which("graphify", path=env.get("PATH")) or os.path.expanduser("~/.local/bin/graphify")
+    if not os.path.isfile(graphify_bin):
+        return False, "graphify binary not found"
+
+    # Also ensure graphify-out/.graphify_python and .graphify_root exist for skill compatibility
+    graphify_out = vault_dir / "graphify-out"
+    graphify_out.mkdir(parents=True, exist_ok=True)
+    shebang_py = "/home/slava/.local/share/uv/tools/graphifyy/bin/python"
+    if os.path.isfile(shebang_py):
+        (graphify_out / ".graphify_python").write_text(shebang_py, encoding="utf-8")
+    (graphify_out / ".graphify_root").write_text(str(vault_dir.resolve()), encoding="utf-8")
+
+    cmd = [graphify_bin, "update", "."]
+    if force:
+        cmd.append("--force")
+
+    res = subprocess.run(
+        cmd,
+        cwd=vault_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    out = (res.stdout + "\n" + res.stderr).strip()
+    return res.returncode == 0, out
+
+
+def load_graph_summary(vault_dir: Path) -> Dict[str, Any]:
+    graph_path = vault_dir / "graphify-out" / "graph.json"
+    if not graph_path.is_file():
+        return {"exists": False, "nodes": 0, "edges": 0, "communities": 0}
+    try:
+        data = json.loads(graph_path.read_text(encoding="utf-8"))
+        nodes = data.get("nodes", [])
+        edges = data.get("links", data.get("edges", []))
+        comms = {n.get("community_name") or n.get("community") for n in nodes if n.get("community") is not None}
+        return {
+            "exists": True,
+            "nodes": len(nodes),
+            "edges": len(edges),
+            "communities": len(comms),
+            "community_names": sorted([str(c) for c in comms if c is not None]),
+        }
+    except Exception as exc:
+        return {"exists": False, "error": str(exc)}
+
+
+def cmd_sync(vault_dir: Path, message: str, push: bool, pull_first: bool, as_json: bool) -> int:
+    env = build_env()
+    ensure_vault_git_setup(vault_dir, env)
+
+    # 1. Run graphify update .
+    g_ok, g_out = update_graphify(vault_dir, env, force=True)
+
+    # 2. Stage all changes and commit if dirty
+    run_git(vault_dir, ["add", "-A"], env=env, check=False)
+    diff_cached = run_git(vault_dir, ["diff", "--cached", "--quiet"], env=env, check=False)
+    committed = False
+    if diff_cached.returncode != 0:
+        commit_res = run_git(vault_dir, ["commit", "-m", message], env=env, check=False)
+        committed = commit_res.returncode == 0
+        # Refresh graphify built_at_commit stamp so GRAPH_REPORT.md matches HEAD
+        update_graphify(vault_dir, env, force=True)
+        run_git(vault_dir, ["add", "graphify-out/"], env=env, check=False)
+        diff2 = run_git(vault_dir, ["diff", "--cached", "--quiet"], env=env, check=False)
+        if diff2.returncode != 0:
+            run_git(vault_dir, ["commit", "--amend", "--no-edit"], env=env, check=False)
+
+    # 3. Pull/reconcile if requested
+    pull_out = ""
+    if pull_first:
+        p_res = run_git(
+            vault_dir,
+            ["pull", "--no-rebase", "--allow-unrelated-histories", "-X", "ours", "origin", "main"],
+            env=env,
+            check=False,
+        )
+        pull_out = (p_res.stdout + "\n" + p_res.stderr).strip()
+
+    # 4. Push to origin/main
+    pushed = False
+    push_out = ""
+    if push:
+        push_res = run_git(vault_dir, ["push", "-u", "origin", "main"], env=env, check=False)
+        if push_res.returncode != 0:
+            # If remote has unrelated initial commit (e.g. README.md), merge with -X ours and retry
+            run_git(
+                vault_dir,
+                ["pull", "--no-rebase", "--allow-unrelated-histories", "-X", "ours", "--no-edit", "origin", "main"],
+                env=env,
+                check=False,
+            )
+            update_graphify(vault_dir, env, force=True)
+            run_git(vault_dir, ["add", "-A"], env=env, check=False)
+            if run_git(vault_dir, ["diff", "--cached", "--quiet"], env=env, check=False).returncode != 0:
+                run_git(vault_dir, ["commit", "-m", "vault: sync graphify after merge with origin/main"], env=env, check=False)
+            push_res = run_git(vault_dir, ["push", "-u", "origin", "main"], env=env, check=False)
+        pushed = push_res.returncode == 0
+        push_out = (push_res.stdout + "\n" + push_res.stderr).strip()
+
+    head_sha = run_git(vault_dir, ["rev-parse", "--short", "HEAD"], env=env, check=False).stdout.strip()
+    summary = {
+        "ok": g_ok and (pushed if push else True),
+        "vault_dir": str(vault_dir),
+        "remote": DEFAULT_REMOTE_URL,
+        "head_commit": head_sha,
+        "committed": committed,
+        "pushed": pushed if push else None,
+        "graphify": load_graph_summary(vault_dir),
+        "graphify_output": g_out,
+        "push_output": push_out if push else None,
+    }
+    if pull_out:
+        summary["pull_output"] = pull_out
+
+    if as_json:
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+    else:
+        g_info = summary["graphify"]
+        print(f"[vault-sync] Vault:   {vault_dir} (HEAD: {head_sha})")
+        print(f"[vault-sync] Graph:   {g_info.get('nodes')} nodes · {g_info.get('edges')} edges · {g_info.get('communities')} communities")
+        print(f"[vault-sync] Commit:  {'created/updated' if committed else 'clean (no new changes)'}")
+        if push:
+            print(f"[vault-sync] Push:    {'OK -> ' + DEFAULT_REMOTE_URL if pushed else 'FAILED: ' + push_out}")
+    return 0 if summary["ok"] else 1
+
+
+def expand_query_terms(question: str) -> List[str]:
+    raw_tokens = [t.lower() for t in re.findall(r"[a-zA-Zа-яА-ЯёЁ0-9_-]+", question) if len(t) >= 2]
+    expanded: List[str] = []
+    seen: Set[str] = set()
+    for tok in raw_tokens:
+        if tok not in seen:
+            seen.add(tok)
+            expanded.append(tok)
+        for syn in CONCEPT_SYNONYMS.get(tok, []):
+            s_low = syn.lower()
+            if s_low not in seen:
+                seen.add(s_low)
+                expanded.append(s_low)
+    return expanded
+
+
+def cmd_query(vault_dir: Path, question: str, dfs: bool, budget: int, as_json: bool) -> int:
+    env = build_env()
+    graph_path = vault_dir / "graphify-out" / "graph.json"
+    if not graph_path.is_file():
+        update_graphify(vault_dir, env, force=True)
+
+    if not graph_path.is_file():
+        print(f"ERROR: Graph file not found at {graph_path}", file=sys.stderr)
+        return 1
+
+    graphify_bin = shutil.which("graphify", path=env.get("PATH")) or os.path.expanduser("~/.local/bin/graphify")
+    cli_output = ""
+    if os.path.isfile(graphify_bin):
+        q_cmd = [graphify_bin, "query", question, "--graph", str(graph_path), "--budget", str(budget)]
+        if dfs:
+            q_cmd.append("--dfs")
+        res = subprocess.run(q_cmd, cwd=vault_dir, env=env, capture_output=True, text=True, timeout=30)
+        cli_output = res.stdout.strip()
+
+    # Also perform enriched graph + frontmatter + cross-language search over graph.json
+    data = json.loads(graph_path.read_text(encoding="utf-8"))
+    nodes: List[Dict[str, Any]] = data.get("nodes", [])
+    edges: List[Dict[str, Any]] = data.get("links", data.get("edges", []))
+    node_map: Dict[str, Dict[str, Any]] = {n["id"]: n for n in nodes if "id" in n}
+
+    terms = expand_query_terms(question)
+    scored_nodes: List[Tuple[int, Dict[str, Any]]] = []
+    for n in nodes:
+        haystack = " ".join(
+            [
+                str(n.get("id", "")),
+                str(n.get("label", "")),
+                str(n.get("community_name", "")),
+                str(n.get("source_file", "")),
+                json.dumps(n.get("frontmatter", {}), ensure_ascii=False) if n.get("frontmatter") else "",
+            ]
+        ).lower()
+        score = sum(2 if t in str(n.get("label", "")).lower() else 1 for t in terms if t in haystack)
+        if score > 0:
+            scored_nodes.append((score, n))
+
+    scored_nodes.sort(key=lambda item: (-item[0], str(item[1].get("source_file", ""))))
+    top_nodes = [n for _, n in scored_nodes[:15]]
+    top_ids = {n["id"] for n in top_nodes}
+
+    # Include 1-hop neighbors of top 5 start nodes
+    start_ids = {n["id"] for _, n in scored_nodes[:5]}
+    related_edges: List[Dict[str, Any]] = []
+    neighbor_ids: Set[str] = set()
+    for e in edges:
+        src = e.get("source")
+        tgt = e.get("target")
+        if src in start_ids or tgt in start_ids or (src in top_ids and tgt in top_ids):
+            src_node = node_map.get(src, {})
+            tgt_node = node_map.get(tgt, {})
+            related_edges.append(
+                {
+                    "source_id": src,
+                    "source": src_node.get("label", src),
+                    "target_id": tgt,
+                    "target": tgt_node.get("label", tgt),
+                    "relation": e.get("relation", "related"),
+                    "confidence": e.get("confidence", "EXTRACTED"),
+                    "source_file": e.get("source_file") or src_node.get("source_file"),
+                    "source_location": e.get("source_location"),
+                }
+            )
+            if src in start_ids and tgt not in top_ids:
+                neighbor_ids.add(tgt)
+            if tgt in start_ids and src not in top_ids:
+                neighbor_ids.add(src)
+
+    for nid in sorted(neighbor_ids)[:10]:
+        if nid in node_map:
+            top_nodes.append(node_map[nid])
+
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "query": question,
+                    "expanded_terms": terms,
+                    "matched_nodes_count": len(scored_nodes),
+                    "nodes": [
+                        {
+                            "id": n.get("id"),
+                            "label": n.get("label"),
+                            "kind": n.get("node_kind"),
+                            "community": n.get("community_name"),
+                            "source_file": n.get("source_file"),
+                            "source_location": n.get("source_location"),
+                        }
+                        for n in top_nodes
+                    ],
+                    "edges": related_edges[:25],
+                    "graphify_cli": cli_output,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+
+    if cli_output and not cli_output.startswith("No matching nodes found"):
+        print(cli_output)
+        print("-" * 64)
+
+    print(f"Vault Graph Search: {question!r} (expanded terms: {', '.join(terms[:10])})")
+    print(f"Matched {len(scored_nodes)} node(s) in {graph_path}:")
+    for n in top_nodes[:12]:
+        print(
+            f"  NODE {n.get('label')} "
+            f"[kind={n.get('node_kind')} | community={n.get('community_name')} | "
+            f"src={n.get('source_file')} loc={n.get('source_location')}]"
+        )
+    if related_edges:
+        print("Connections:")
+        for e in related_edges[:15]:
+            print(
+                f"  EDGE {e['source']} --{e['relation']} [{e['confidence']}]--> {e['target']} "
+                f"(src={e.get('source_file')} {e.get('source_location') or ''})"
+            )
+    return 0
+
+
+def cmd_status(vault_dir: Path, as_json: bool) -> int:
+    env = build_env()
+    ensure_vault_git_setup(vault_dir, env)
+    branch = run_git(vault_dir, ["rev-parse", "--abbrev-ref", "HEAD"], env=env, check=False).stdout.strip()
+    head = run_git(vault_dir, ["log", "-1", "--oneline"], env=env, check=False).stdout.strip()
+    remote = run_git(vault_dir, ["remote", "get-url", "origin"], env=env, check=False).stdout.strip()
+    status_lines = [
+        l for l in run_git(vault_dir, ["status", "--short"], env=env, check=False).stdout.splitlines() if l.strip()
+    ]
+    g_summary = load_graph_summary(vault_dir)
+    info = {
+        "ok": True,
+        "vault_dir": str(vault_dir),
+        "branch": branch,
+        "head": head,
+        "remote": remote,
+        "dirty_files": status_lines,
+        "graphify": g_summary,
+    }
+    if as_json:
+        print(json.dumps(info, ensure_ascii=False, indent=2))
+    else:
+        print(f"Vault Dir:   {vault_dir}")
+        print(f"Branch:      {branch} ({head})")
+        print(f"Remote:      {remote}")
+        print(f"Dirty Files: {len(status_lines)}")
+        print(
+            f"Graphify:    {g_summary.get('nodes')} nodes, "
+            f"{g_summary.get('edges')} edges, {g_summary.get('communities')} communities"
+        )
+    return 0
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="vault-sync: Synchronize DiveTeam vault/ with graphify and sviatoslav-shpirko/memvault"
+    )
+    parser.add_argument("-m", "--message", default="vault: sync knowledge base and graphify graph", help="Commit message")
+    parser.add_argument("--no-push", action="store_true", help="Skip git push to origin/main")
+    parser.add_argument("--pull", action="store_true", help="Pull from origin/main before pushing")
+    parser.add_argument("--vault-dir", default=DEFAULT_VAULT_DIR, help="Path to vault directory")
+    parser.add_argument("--json", action="store_true", help="Emit JSON output")
+
+    subparsers = parser.add_subparsers(dest="subcommand")
+
+    sync_p = subparsers.add_parser("sync", help="Update graphify, commit changes, and push to origin/main")
+    sync_p.add_argument("-m", "--message", default="vault: sync knowledge base and graphify graph", help="Commit message")
+    sync_p.add_argument("--no-push", action="store_true", help="Skip git push to origin/main")
+    sync_p.add_argument("--pull", action="store_true", help="Pull from origin/main before pushing")
+    sync_p.add_argument("--json", action="store_true", help="Emit JSON output")
+
+    query_p = subparsers.add_parser("query", help="Query the vault graphify knowledge graph")
+    query_p.add_argument("question", help="Search query or question")
+    query_p.add_argument("--dfs", action="store_true", help="Use DFS traversal")
+    query_p.add_argument("--budget", type=int, default=2000, help="Token budget for graphify query")
+    query_p.add_argument("--json", action="store_true", help="Emit JSON output")
+
+    status_p = subparsers.add_parser("status", help="Show vault git and graphify status")
+    status_p.add_argument("--json", action="store_true", help="Emit JSON output")
+
+    args = parser.parse_args()
+    vault_dir = Path(args.vault_dir).expanduser().resolve()
+    sub = args.subcommand or "sync"
+
+    if sub == "query":
+        sys.exit(cmd_query(vault_dir, args.question, args.dfs, args.budget, args.json))
+    elif sub == "status":
+        sys.exit(cmd_status(vault_dir, args.json))
+    else:
+        sys.exit(
+            cmd_sync(
+                vault_dir=vault_dir,
+                message=args.message,
+                push=not getattr(args, "no_push", False),
+                pull_first=getattr(args, "pull", False),
+                as_json=getattr(args, "json", False),
+            )
+        )
+
+
+if __name__ == "__main__":
+    main()
